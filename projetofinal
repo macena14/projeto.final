@@ -1,1 +1,42 @@
-ainda será iniciado.
+#include <zephyr/kernel.h>
+#include <zephyr/sys/printk.h>
+
+#define MY_STACK_SIZE 1024
+#define MY_PRIORITY 0
+
+K_FIFO_DEFINE(fifo);
+
+struct fila {
+    void *fifo_r; // define a FIFO
+    char value[64];
+};
+//********************************* THREAD QUE ESCREVE STRING****************/
+void F1(void) {//Escreve
+
+    struct fila dado;
+while(1){
+    strcpy(dado.value, "Kauan");
+        printk("Escrito 1: %s\n", dado.value);
+        k_fifo_put(&fifo, &dado); // Insere no FIFO
+        k_msleep(1000); // Espera 1 s
+    }}
+
+
+//********************************* THREAD QUE LE STRING ****************/	
+void F3(void) {//Le
+
+    struct fila *dado_r;
+
+    while (1) {
+        dado_r = k_fifo_get(&fifo, K_FOREVER); // Espera dados
+        if (dado_r) {
+            printk("Lido 1: %s\n", dado_r->value);
+        }
+		k_msleep(1000); // Espera 1 s
+    }
+}
+
+
+K_THREAD_DEFINE(F1_id, MY_STACK_SIZE, F1, NULL, NULL, NULL, MY_PRIORITY, 0, 0);
+K_THREAD_DEFINE(F3_id, MY_STACK_SIZE, F3, NULL, NULL, NULL, MY_PRIORITY, 0, 0);
+
