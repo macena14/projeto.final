@@ -1,42 +1,197 @@
 #include <zephyr/kernel.h>
-#include <zephyr/sys/printk.h>
+#include <stdio.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/uart.h>
+#include <zephyr/drivers/gpio.h>
+#include <string.h>
 
-#define MY_STACK_SIZE 1024
-#define MY_PRIORITY 0
+/* change this to any other UART peripheral if desired */
+#define UART_DEVICE_NODE DT_CHOSEN(zephyr_shell_uart)
 
-K_FIFO_DEFINE(fifo);
-
-struct fila {
-    void *fifo_r; // define a FIFO
-    char value[64];
-};
-//********************************* THREAD QUE ESCREVE STRING****************/
-void F1(void) {//Escreve
-
-    struct fila dado;
-while(1){
-    strcpy(dado.value, "Kauan");
-        printk("Escrito 1: %s\n", dado.value);
-        k_fifo_put(&fifo, &dado); // Insere no FIFO
-        k_msleep(1000); // Espera 1 s
-    }}
+#define MSG_SIZE 32
+#define PIN 16  // Pino PTA16
+#define PIN_RX 5  // Pino de interrupcao 5
+#define GPIO_PORT "GPIOA"  // Banco de GPIO A
+#define GPIO_DEV_NAME "GPIO_0" // Nome do dispositivo GPIO (depende da configuração do seu hardware)
+K_FIFO_DEFINE(fifo_rx);
 
 
-//********************************* THREAD QUE LE STRING ****************/	
-void F3(void) {//Le
 
-    struct fila *dado_r;
+char tx_buf[MSG_SIZE];
+	//char msg[] = "kauan";
+	int pre = 0b01010101;
+	int sync = 0b00010110;
+	int id = 0b11111000;//nosso Id e o lenght sera incluido
+	int pos = 0b00010111;
+	bool flag = 0;
+	int rx_dado;
 
-    while (1) {
-        dado_r = k_fifo_get(&fifo, K_FOREVER); // Espera dados
-        if (dado_r) {
-            printk("Lido 1: %s\n", dado_r->value);
-        }
-		k_msleep(1000); // Espera 1 s
-    }
+/* queue to store up to 10 messages (aligned to 4-byte boundary) */
+K_MSGQ_DEFINE(uart_msgq, MSG_SIZE, 10, 4);
+
+static const struct device *const uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE);
+
+
+//const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpiob));
+
+const struct device *gpio_dev;
+static struct gpio_callback gpio_cb;
+
+/* receive buffer used in UART ISR callback */
+static char rx_buf[MSG_SIZE];
+static int rx_buf_pos;
+
+//******************* CALLBACK DA INTERRUPCAO QUE LE A PORTA DO RECEPTOR ***********/
+
+void gpio_callback_handler(const struct device *dev, struct gpio_callback *cb, uint32_t pins){
+
+flag = 1;
+
+
 }
 
+//******************* CALLBACK DA INTERRUPCAO QUE LE DO TERMINAL PELA UART ***********/
+void serial_cb(const struct device *dev, void *user_data)
+{
+	uint8_t c;	
 
-K_THREAD_DEFINE(F1_id, MY_STACK_SIZE, F1, NULL, NULL, NULL, MY_PRIORITY, 0, 0);
-K_THREAD_DEFINE(F3_id, MY_STACK_SIZE, F3, NULL, NULL, NULL, MY_PRIORITY, 0, 0);
+	/* read until FIFO empty */
+	while (uart_fifo_read(uart_dev, &c, 1) == 1) {
+		if ((c == '\n' || c == '\r') && rx_buf_pos > 0) {
+			/* terminate string */
+			rx_buf[rx_buf_pos] = '\0';
 
+			/* if queue is full, message is silently dropped */
+			k_msgq_put(&uart_msgq, &rx_buf, K_NO_WAIT);
+
+			/* reset the buffer (it was copied to the msgq) */
+			rx_buf_pos = 0;
+		} else if (rx_buf_pos < (sizeof(rx_buf) - 1)) {
+			rx_buf[rx_buf_pos++] = c;
+		}
+		/* else: characters beyond buffer size are dropped */
+	}
+}
+//********************************* FUNCAO QUE IMPRIME NO TERMINAL PELA UART ***********/
+void print_uart(char *buf)
+{
+	int msg_len = strlen(buf);
+
+	for (int i = 0; i < msg_len; i++) {
+		uart_poll_out(uart_dev, buf[i]);
+	}
+}
+//********************************* FUNCAO QUE TRANSMITE UMA FRASE PELA PORTA A ***********/
+void tx_msg(char arr[])
+{
+	int msg_len2 = strlen(arr);
+	//const struct device *gpio_dev;
+	gpio_pin_configure(gpio_dev,PIN,GPIO_OUTPUT_ACTIVE);	
+		
+		for(int i=0;i<msg_len2;i++)
+		for (int a = 0;a<8;a++){
+			gpio_pin_set(gpio_dev, PIN, (arr[i]>>a) & 0x01);//esta so extraindo o bit, e nao salvando...	
+			k_msleep(10);	
+			}
+	}
+	//********************************* FUNCAO QUE TRANSMITE O CABECALHO BINARIO PELA PORTA A ***********/
+void tx_header(int b)
+{	
+	//const struct device *gpio_dev;
+	gpio_pin_configure(gpio_dev,PIN,GPIO_OUTPUT_ACTIVE);	
+		
+		for (int i = 0;i<8;i++){
+			gpio_pin_set(gpio_dev, PIN, (b>>i) & 0x01);//esta so extraindo o bit, e nao salvando...	
+			k_msleep(1);	
+			}
+	}
+//********************************* THREAD QUE TRANSMITE PELA PORTA A ***********/
+void TX(void)
+{	
+	/* configure interrupt and callback to receive data */
+	uart_irq_callback_user_data_set(uart_dev, serial_cb, NULL);
+		uart_irq_rx_enable(uart_dev);//habilita a interrupcao
+
+		/* indefinitely wait for input from the user */
+	while (k_msgq_get(&uart_msgq, &tx_buf, K_FOREVER) == 0) {//fica esperando dar 0 no k_msgq_get
+		 tx_header(pre);
+		 tx_header(sync);
+		 id = id + strlen(tx_buf);
+		 tx_header(id);
+		 tx_msg(tx_buf);
+		 tx_header(pos);		
+	}	
+	}
+//********************************* FUNCAO QUE ECOA NO TERMINAL ***********/
+void TX_TERM(void)
+{
+	char tx_buf[MSG_SIZE];
+	
+	/* configure interrupt and callback to receive data */
+	uart_irq_callback_user_data_set(uart_dev, serial_cb, NULL);
+
+		uart_irq_rx_enable(uart_dev);//habilita a interrupcao
+
+	print_uart("Hello! I'm your echo bot.\r\n");
+	print_uart("Tell me something and press enter:\r\n");
+
+	/* indefinitely wait for input from the user */
+	while (k_msgq_get(&uart_msgq, &tx_buf, K_FOREVER) == 0) {//fica esperando dar 0 no k_msgq_get
+		print_uart("Echo: ");
+		print_uart(tx_buf);
+		print_uart("\r\n");
+	}
+}
+//********************************* THREAD DE RECEPCAO ***********/
+void RX(void)
+{
+	gpio_init_callback(&gpio_cb, gpio_callback_handler, BIT(PIN_RX));//Inicializar o callback da interrupcao
+
+	gpio_add_callback(gpio_dev, &gpio_cb);//Configurar a interrupcao do pino
+
+	gpio_pin_interrupt_configure(gpio_dev, PIN, GPIO_INT_EDGE_BOTH);//Habilitar a interrupcao do pino
+
+			while(flag == 1){
+				gpio_pin_interrupt_configure(gpio_dev, PIN, GPIO_INT_DISABLE);
+
+				int rx_dado = 0;
+				int rx_fin = 0;
+				for (int i2=0;i2<8;i2++){
+			for (int i=0;i<4;i++){
+				if(gpio_pin_get(gpio_dev, PIN_RX)==1){
+
+					rx_dado = rx_dado & 0x01;
+				} else{
+					rx_dado = rx_dado & 0xfe;
+				}
+				k_busy_wait(2500);  // Espera de 2500 ciclos de clock
+				rx_dado = rx_dado<<1;//rodou 4 x
+				}
+				if(rx_dado == 15){ // o dado eh 1
+					rx_fin = rx_fin & 0x01;
+				}else{
+					if(rx_dado == 0){// o dado eh 0
+					rx_fin = rx_fin & 0xfe;
+				} else{// o que faz se o dado nao e valido
+				rx_dado=0;
+				rx_fin=0;
+				flag=0;
+				gpio_pin_interrupt_configure(gpio_dev, PIN, GPIO_INT_EDGE_BOTH);
+				break;
+				}				
+			}
+			rx_fin = rx_fin<<1;//shiftou 8 x o rx_fin
+			}//o que faz se o dado foi valido e carregou o byte inteiro
+				k_fifo_put(&fifo_rx, &rx_fin);//coloca na fifo o dado validado
+				rx_dado=0;
+				rx_fin=0;
+				flag=0;
+				gpio_pin_interrupt_configure(gpio_dev, PIN, GPIO_INT_EDGE_BOTH);
+			
+	}
+	}
+//********************************* DECLARACAO DAS THREADS ***********/
+
+K_THREAD_DEFINE(TX_TERM_id, 1024, TX_TERM, NULL, NULL, NULL, 0, 0, 0);
+K_THREAD_DEFINE(TX_id, 1024, TX, NULL, NULL, NULL, 0, 0, 0);
+K_THREAD_DEFINE(RX_id, 1024, RX, NULL, NULL, NULL, 0, 0, 0);
