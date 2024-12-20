@@ -1,197 +1,245 @@
 #include <zephyr/kernel.h>
 #include <stdio.h>
-#include <zephyr/device.h>
+#include <zephyr/device.h> //para os gpio's
 #include <zephyr/drivers/uart.h>
-#include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/gpio.h> //para os gpio's
 #include <string.h>
+#include <zephyr/sys/printk.h>
+#include <stdint.h>
+
 
 /* change this to any other UART peripheral if desired */
 #define UART_DEVICE_NODE DT_CHOSEN(zephyr_shell_uart)
 
-#define MSG_SIZE 32
-#define PIN 16  // Pino PTA16
-#define PIN_RX 5  // Pino de interrupcao 5
-#define GPIO_PORT "GPIOA"  // Banco de GPIO A
-#define GPIO_DEV_NAME "GPIO_0" // Nome do dispositivo GPIO (depende da configuração do seu hardware)
-K_FIFO_DEFINE(fifo_rx);
+#define BAUD          10000 // 900us para transmissao
+#define MSG_SIZE      8
+#define PIN_TX        3        // Pino 3 (AMARELO)
+#define PIN_RX        1        // Pino 1 (VERDE)
+#define PIN_RX_AUX    0        // Pino 0 (VERMELHO)
 
-
+#define ZERA() { \
+    bit_c = 0; \
+	start = 0; \
+	rx_c = 0;  \
+	rx_fin = 0;	\
+	start_c = 0; \
+}
 
 char tx_buf[MSG_SIZE];
-	//char msg[] = "kauan";
-	int pre = 0b01010101;
-	int sync = 0b00010110;
-	int id = 0b11111000;//nosso Id e o lenght sera incluido
-	int pos = 0b00010111;
-	bool flag = 0;
-	int rx_dado;
+char pre = 0x55;//01010101
+char sync = 0x16;//11011100
+char id_ini = 0xf8; // 11111000 -> Id sera adicionado o lenght (5 msb parao ID e 3 lsb para o lenght)
+char pos = 0x17; // 00010111
+//-----------------------------------------
+int rx_dado = 0;
+int rx_fin = 0;
+int start = 0;
+int rx_id;
+int bit_c = 0;//contador de de bit valido
+char arr2[11];
+int dado_l = 0;
+int rx_c = 0;//contador de amostragens
+//-----------------------------------------
+char pack_fin[11];
+int start_c; //contador do start bit
+int id;
 
 /* queue to store up to 10 messages (aligned to 4-byte boundary) */
 K_MSGQ_DEFINE(uart_msgq, MSG_SIZE, 10, 4);
+K_MSGQ_DEFINE(fifo_rx, 56, 10, 4);
 
 static const struct device *const uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE);
-
-
-//const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpiob));
-
-const struct device *gpio_dev;
-static struct gpio_callback gpio_cb;
+const struct device *stx = DEVICE_DT_GET(DT_NODELABEL(gpiob));
+// const struct device *gpio_dev;
 
 /* receive buffer used in UART ISR callback */
-static char rx_buf[MSG_SIZE];
-static int rx_buf_pos;
+static char rx_buf[MSG_SIZE]; // tamanho da msg de saida
+static int rx_buf_pos;        // posicao no buffer de recepcao
 
-//******************* CALLBACK DA INTERRUPCAO QUE LE A PORTA DO RECEPTOR ***********/
+//  1. ----------------------------- Funcao que processa a recepacao quando o timer expira --------------------------------------
+void timer_expiry_fn(struct k_timer *timer_id) // vem pra ca quando o timer de recepcao expira
+{
+	gpio_pin_configure(stx, PIN_RX, GPIO_INPUT | GPIO_PULL_DOWN); // configura o pino de entrada
+	gpio_pin_set(stx, PIN_RX_AUX,1); // TESTE: sobe o pino PTB0 so pra saber que o ciclo esta ativo no oscilo
 
-void gpio_callback_handler(const struct device *dev, struct gpio_callback *cb, uint32_t pins){
+	if (gpio_pin_get(stx, PIN_RX) == 1  && start_c <=9) {//&& start==0
+		start_c++;		
+		if(start_c==9){
+			start=1;
+		}
+	}
+	
 
-flag = 1;
+	if (gpio_pin_get(stx, PIN_RX) == 1) {   // testa se o pino de entrada esta em 1...
+		rx_dado = rx_dado | 0x01; // se sim, poe 1 no lsb do rx_dado...
+		//start = 1;                      // se sim, poe o flag start em 1
+		rx_c++; // se sim, soma 1 no contador de rx_c, que eh o contador de amostragens
+		 
+		
+	} else {                                // se naõ...
+		rx_dado = rx_dado & 0xfe; // poe 0 no lsb do rx_dado...
+		if (start == 1) {               // se start esta em 1...
+			rx_c++;                 // so soma 1 no rx_c se ja recebeu algum 1
+		}
+		
+	}
 
+	
 
+	//  1.1 -------------------------------- Testa se recebeu 3 iguais -----------------------------------------
+
+	if (rx_c > 9 && rx_c % 3 == 0) { // se rx_c ja passou pelo Start_bit e eh multiplo de 3, faz:
+		if ((rx_dado & 0x07) ==  0x07) {                     // testa se recebeu tres "1" em seguida...
+			rx_fin = (rx_fin << 1)| 0x01;         // se sim shifta e poe "1" no lsb....	do rx_fin 	
+			bit_c++;		
+		} else { /// se nao de 0000000111...
+			if ((rx_dado | 0xf8) == 0xf8) {             // testa se recebeu tres "0" em seguida se sim shifta 1 para esquerda
+				rx_fin = (rx_fin << 1)& 0xfe; 			// se sim, poe 0 no lsb do rx_fin	
+				bit_c++;			
+			} else {
+				ZERA();
+			}
+		}
+		//  1.2 ----------------------------------- Checagem bit a bit : PRE --------------------------------
+		if(bit_c<=8){//PODE USAR rx_c  COM 24???
+			if ((rx_fin & 0x01) != ((pre>>(8-bit_c) & 0x01))) {//pre = 01010101
+				ZERA();		
+		}
+	}
+	//  1.3 -------------------------------------- Checagem bit a bit : SYNC -------------------------------
+		if(bit_c>=9 && bit_c<=16){////PODE USAR rx_c  COM 21 E 48???
+			if ((rx_fin & 0x01) != ((sync>>(8-(bit_c-8)) & 0x01))) {//sync = 00010110
+				ZERA();		
+
+		}
+	}
+	//  1.4 ------------------------------------- Extrai ID e Lenght ------------------------------
+	if (rx_c == 81) {                  // se bit_count eh 24, entao o id foi recebido...PODE FAZER COM O rx_c EM 72(+9)??
+		dado_l = rx_fin & 0x07; // mascara para extrair o lenght do dado...
+		rx_id = ((rx_fin >> 3) & 0x1f); // shiftou 5 para direita e fez um & para	    
+		 }
+		//  1.3 -------------------------------------- Checagem bit a bit : POS -------------------------------
+		if(bit_c>=(25+(8*dado_l)) && bit_c<=(32+(8*dado_l))){////PODE USAR rx_c  COM 21 E 48???
+			if ((rx_fin & 0x01) != ((pos>>(8-(bit_c-(24+(dado_l*8)))) & 0x01))) {//sync = 00010110
+				ZERA();		
+		}
+	}
+	}
+	//  1.6 -------------------- Transfere para o Array a cada 8 bits --------------------------------
+	if (bit_c > 0 && bit_c % 8 == 0) {
+		arr2[(bit_c / 8) - 1] = rx_fin;
+		}
+	//  1.5 ----------------------- Copia o dado para message queue ------------------------------
+	if (rx_c > (((dado_l + 4) * 24) + 9)) {
+		ZERA();
+		k_msgq_put(&fifo_rx, &arr2, K_NO_WAIT);
+	}
+	rx_dado = rx_dado << 1; // shifta o rx_dado 1 bit para esquerda
+	gpio_pin_set(stx, PIN_RX_AUX, 0);
 }
+//  2.0 ----------------- Definicao do timer --------------------------------------
+K_TIMER_DEFINE(my_timer, timer_expiry_fn, NULL);
 
-//******************* CALLBACK DA INTERRUPCAO QUE LE DO TERMINAL PELA UART ***********/
+//  3.0 ----------------- Callback da Interrupcao que Le da UART -----------------
 void serial_cb(const struct device *dev, void *user_data)
 {
-	uint8_t c;	
-
+	uint8_t c;
 	/* read until FIFO empty */
 	while (uart_fifo_read(uart_dev, &c, 1) == 1) {
 		if ((c == '\n' || c == '\r') && rx_buf_pos > 0) {
 			/* terminate string */
 			rx_buf[rx_buf_pos] = '\0';
-
 			/* if queue is full, message is silently dropped */
 			k_msgq_put(&uart_msgq, &rx_buf, K_NO_WAIT);
-
 			/* reset the buffer (it was copied to the msgq) */
 			rx_buf_pos = 0;
-		} else if (rx_buf_pos < (sizeof(rx_buf) - 1)) {
+		} else if (rx_buf_pos < (sizeof(rx_buf) - 1) ) {//&& c>0x60 && c<0x7A
 			rx_buf[rx_buf_pos++] = c;
+			
 		}
 		/* else: characters beyond buffer size are dropped */
-	}
+		}
 }
-//********************************* FUNCAO QUE IMPRIME NO TERMINAL PELA UART ***********/
-void print_uart(char *buf)
-{
-	int msg_len = strlen(buf);
-
-	for (int i = 0; i < msg_len; i++) {
-		uart_poll_out(uart_dev, buf[i]);
-	}
-}
-//********************************* FUNCAO QUE TRANSMITE UMA FRASE PELA PORTA A ***********/
-void tx_msg(char arr[])
-{
-	int msg_len2 = strlen(arr);
-	//const struct device *gpio_dev;
-	gpio_pin_configure(gpio_dev,PIN,GPIO_OUTPUT_ACTIVE);	
-		
-		for(int i=0;i<msg_len2;i++)
-		for (int a = 0;a<8;a++){
-			gpio_pin_set(gpio_dev, PIN, (arr[i]>>a) & 0x01);//esta so extraindo o bit, e nao salvando...	
-			k_msleep(10);	
-			}
-	}
-	//********************************* FUNCAO QUE TRANSMITE O CABECALHO BINARIO PELA PORTA A ***********/
-void tx_header(int b)
-{	
-	//const struct device *gpio_dev;
-	gpio_pin_configure(gpio_dev,PIN,GPIO_OUTPUT_ACTIVE);	
-		
-		for (int i = 0;i<8;i++){
-			gpio_pin_set(gpio_dev, PIN, (b>>i) & 0x01);//esta so extraindo o bit, e nao salvando...	
-			k_msleep(1);	
-			}
-	}
-//********************************* THREAD QUE TRANSMITE PELA PORTA A ***********/
-void TX(void)
-{	
-	/* configure interrupt and callback to receive data */
-	uart_irq_callback_user_data_set(uart_dev, serial_cb, NULL);
-		uart_irq_rx_enable(uart_dev);//habilita a interrupcao
-
-		/* indefinitely wait for input from the user */
-	while (k_msgq_get(&uart_msgq, &tx_buf, K_FOREVER) == 0) {//fica esperando dar 0 no k_msgq_get
-		 tx_header(pre);
-		 tx_header(sync);
-		 id = id + strlen(tx_buf);
-		 tx_header(id);
-		 tx_msg(tx_buf);
-		 tx_header(pos);		
-	}	
-	}
-//********************************* FUNCAO QUE ECOA NO TERMINAL ***********/
-void TX_TERM(void)
-{
-	char tx_buf[MSG_SIZE];
-	
-	/* configure interrupt and callback to receive data */
-	uart_irq_callback_user_data_set(uart_dev, serial_cb, NULL);
-
-		uart_irq_rx_enable(uart_dev);//habilita a interrupcao
-
-	print_uart("Hello! I'm your echo bot.\r\n");
-	print_uart("Tell me something and press enter:\r\n");
-
-	/* indefinitely wait for input from the user */
-	while (k_msgq_get(&uart_msgq, &tx_buf, K_FOREVER) == 0) {//fica esperando dar 0 no k_msgq_get
-		print_uart("Echo: ");
-		print_uart(tx_buf);
-		print_uart("\r\n");
-	}
-}
-//********************************* THREAD DE RECEPCAO ***********/
+//  8.0 ------------------------ Thread que recebe e trata os dados --------------------------------
 void RX(void)
 {
-	gpio_init_callback(&gpio_cb, gpio_callback_handler, BIT(PIN_RX));//Inicializar o callback da interrupcao
+	k_timer_start(&my_timer, K_USEC(0),K_USEC(BAUD / 3)); // chama o callback de recepcao a cada 2.5ms
+	gpio_pin_configure(stx, PIN_RX, GPIO_INPUT);
+	gpio_pin_configure(stx, PIN_RX_AUX, GPIO_OUTPUT_INACTIVE);
+}
+//  5.0 ------------------------- Funcao que constroi o pacote de envio -------------------------------
+void package(char tx_buf[]){
+	
+	pack_fin[0]=pre;
+	pack_fin[1]=sync;
+	pack_fin[2]=id_ini+strlen(tx_buf);
 
-	gpio_add_callback(gpio_dev, &gpio_cb);//Configurar a interrupcao do pino
-
-	gpio_pin_interrupt_configure(gpio_dev, PIN, GPIO_INT_EDGE_BOTH);//Habilitar a interrupcao do pino
-
-			while(flag == 1){
-				gpio_pin_interrupt_configure(gpio_dev, PIN, GPIO_INT_DISABLE);
-
-				int rx_dado = 0;
-				int rx_fin = 0;
-				for (int i2=0;i2<8;i2++){
-			for (int i=0;i<4;i++){
-				if(gpio_pin_get(gpio_dev, PIN_RX)==1){
-
-					rx_dado = rx_dado & 0x01;
-				} else{
-					rx_dado = rx_dado & 0xfe;
-				}
-				k_busy_wait(2500);  // Espera de 2500 ciclos de clock
-				rx_dado = rx_dado<<1;//rodou 4 x
-				}
-				if(rx_dado == 15){ // o dado eh 1
-					rx_fin = rx_fin & 0x01;
-				}else{
-					if(rx_dado == 0){// o dado eh 0
-					rx_fin = rx_fin & 0xfe;
-				} else{// o que faz se o dado nao e valido
-				rx_dado=0;
-				rx_fin=0;
-				flag=0;
-				gpio_pin_interrupt_configure(gpio_dev, PIN, GPIO_INT_EDGE_BOTH);
-				break;
-				}				
-			}
-			rx_fin = rx_fin<<1;//shiftou 8 x o rx_fin
-			}//o que faz se o dado foi valido e carregou o byte inteiro
-				k_fifo_put(&fifo_rx, &rx_fin);//coloca na fifo o dado validado
-				rx_dado=0;
-				rx_fin=0;
-				flag=0;
-				gpio_pin_interrupt_configure(gpio_dev, PIN, GPIO_INT_EDGE_BOTH);
-			
+	for(int i=3;i<=(2+strlen(tx_buf));i++){
+	pack_fin[i] = tx_buf[i-3];
 	}
-	}
-//********************************* DECLARACAO DAS THREADS ***********/
+	pack_fin[3+(strlen(tx_buf))]=pos;
+	pack_fin[4+(strlen(tx_buf))]='\0';
+}
+//  7.0 ------------------------- Funcao que transmite uma string pelo port B ---------------------
+void tx_msg(char arr[])
+{
+	gpio_pin_configure(stx, PIN_TX, GPIO_OUTPUT_ACTIVE);
 
-K_THREAD_DEFINE(TX_TERM_id, 1024, TX_TERM, NULL, NULL, NULL, 0, 0, 0);
-K_THREAD_DEFINE(TX_id, 1024, TX, NULL, NULL, NULL, 0, 0, 0);
+	gpio_pin_set(stx, 0x3, 1); // 
+	k_usleep(3 * BAUD);
+
+	for (int i = 0; i < strlen(arr); i++) {
+		for (int a = 0; a < 8; a++) {
+			gpio_pin_set(stx, PIN_TX,(arr[i] >> (7 - a)) & 0x01); // manda o msb primeiro...
+			k_usleep(BAUD);
+		}
+	}
+	gpio_pin_set(stx, 0x3, 0); // 
+}
+//  9.0 ------------------------ Thread que transmite ---------------------------------------------
+void TX_RF(void)
+{
+printf("\n");
+	for(int i=0;i<(MSG_SIZE);i++){
+		rx_buf[i]=0;		
+	}
+	ZERA();
+	printf("\n");	
+	rx_buf_pos=0;	
+	char tx_buf[MSG_SIZE];
+
+	/* configure interrupt and callback to receive data */
+	uart_irq_callback_user_data_set(uart_dev, serial_cb,NULL);                 // define o callback da int da UART
+	uart_irq_rx_enable(uart_dev);                          // habilita a interrupcao da UART
+	gpio_pin_configure(stx, PIN_TX, GPIO_OUTPUT_INACTIVE); // configura o pino do TX
+
+	
+	while (k_msgq_get(&uart_msgq, &tx_buf, K_FOREVER) == 0) { // fica esperando dar 0 no k_msgq_get
+	package(tx_buf);
+	// //------------------------------------ TESTE
+	printf("\n");
+	id = id_ini + strlen(tx_buf);
+	
+	//---------------------- Envia os dados --------------------------		
+		tx_msg(pack_fin);//transmite o pacote construido com o protocolo inteiro		
+	}
+}
+//  10.0 ------------------------- THREAD QUE MANDA PRO TERMINAL O QUE RECEBEU ----------------/
+void TX_TERM(void){	
+
+	/* indefinitely wait for input from the user */
+	while (k_msgq_get(&fifo_rx, &arr2, K_FOREVER) == 0) { // fica esperando dar 0 no k_msgq_get
+		// ---------------------- Envia no terminal --------------------------
+		printf("\nSeu amigo %d falou: ",rx_id);
+
+		for(int i=3;i<(strlen(arr2)-1);i++){
+			printf("%c",arr2[i]);
+		}
+		printf("\n\n");
+		k_msleep(100);
+	}
+}
+//  11.0 ------------------------ DECLARACAO DAS THREADS ----------------------------------/
+K_THREAD_DEFINE(TX_RF_id, 1024, TX_RF, NULL, NULL, NULL, 0, 0, 0);
 K_THREAD_DEFINE(RX_id, 1024, RX, NULL, NULL, NULL, 0, 0, 0);
+K_THREAD_DEFINE(TX_TERM_id, 1024, TX_TERM, NULL, NULL, NULL, 0, 0, 0);
